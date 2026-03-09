@@ -10,7 +10,7 @@ import './i18n/config'; // Import i18n setup
 import { fontBase64 } from './fonts/NotoSansBengali-Regular';
 
 // --- Firebase & Image Compression ---
-import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, query, where } from './api';
+import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, query, where, showToast } from './api';
 const db = {}; // api.js handles routing — db is a placeholder
 import imageCompression from 'browser-image-compression';
 
@@ -27,6 +27,7 @@ function App() {
   const fileInputRef = useRef(null);
   const [showSettings, setShowSettings] = useState(false);
   const [appTheme, setAppTheme] = useState(() => localStorage.getItem('appTheme') || 'neon');
+  const [isSaving, setIsSaving] = useState(false); // button loading state
 
   useEffect(() => {
     if (appTheme && appTheme !== 'neon') {
@@ -643,13 +644,15 @@ function App() {
       lastMessageSentAt: null
     };
 
-    try {
-      await setDoc(doc(db, 'dueMessages', msgId), newMsg);
-      setFormData({ ...formData, clientName: '', dueAmount: '', phone: '' });
-      alert("Due recorded successfully!");
-    } catch (err) {
+    // ⚡ Optimistic: clear form and show success immediately
+    setFormData({ ...formData, clientName: '', dueAmount: '', phone: '' });
+    showToast('✓ Due recorded!', 'success');
+
+    // Background save (non-blocking)
+    setDoc(doc(db, 'dueMessages', msgId), newMsg, { silent: true }).catch(err => {
       console.error(err);
-    }
+      showToast('⚠ Due save failed!', 'error');
+    });
   };
 
   const handleSendDueMessage = async (msg) => {
@@ -679,8 +682,9 @@ function App() {
 
   const handleTransactionSubmit = async (e) => {
     e.preventDefault();
-    if (!formData.amount || isNaN(formData.amount)) return;
+    if (!formData.amount || isNaN(formData.amount) || isSaving) return;
 
+    setIsSaving(true);
     const txnId = Date.now().toString();
     const newTransaction = {
       ...formData,
@@ -695,28 +699,36 @@ function App() {
     if (formData.imageFile) {
       try {
         const compressedFile = await imageCompression(formData.imageFile, {
-          maxSizeMB: 0.1, // Compress to ~100kb
+          maxSizeMB: 0.1,
           maxWidthOrHeight: 800,
           useWebWorker: true
         });
-
         const base64data = await new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.readAsDataURL(compressedFile);
           reader.onloadend = () => resolve(reader.result);
           reader.onerror = error => reject(error);
         });
-
         newTransaction.imageURL = base64data;
       } catch (err) {
         console.error("Image Compression Failed:", err);
       }
     }
-    delete newTransaction.imageFile; // Remove File object before saving to Firestore
+    delete newTransaction.imageFile;
 
-    await setDoc(doc(db, 'transactions', txnId), newTransaction);
+    // ⚡ Optimistic: navigate away INSTANTLY, save in background
+    setFormData({
+      amount: '', partyName: '', remark: '', category: '',
+      paymentMode: 'Cash', type: 'IN', isInventoryLinked: false,
+      selectedProductId: '', inventoryQuantity: '', imageFile: null
+    });
+    setCurrentView('dashboard');
+    setIsSaving(false);
 
-    // Handle Inventory Linkage
+    // Background saves (non-blocking)
+    setDoc(doc(db, 'transactions', txnId), newTransaction, { silent: false });
+
+    // Handle Inventory Linkage in background
     if (formData.isInventoryLinked && formData.selectedProductId && formData.inventoryQuantity) {
       const linkQty = parseInt(formData.inventoryQuantity, 10);
       const linkedProduct = inventory.find(p => p.id.toString() === formData.selectedProductId.toString());
@@ -725,7 +737,6 @@ function App() {
         const isWalletIncome = formData.type === 'IN';
         const stockType = isWalletIncome ? 'OUT' : 'IN';
         const stockTxnId = (Date.now() + 1).toString();
-
         const newStockTxn = {
           id: stockTxnId,
           businessId: activeBusinessId,
@@ -734,50 +745,23 @@ function App() {
           productName: linkedProduct.name,
           type: stockType,
           count: linkQty,
-          price: newTransaction.amount,
+          price: parseFloat(formData.amount),
           companyName: formData.partyName || '-',
           paymentStatus: 'Paid',
-          date: newTransaction.date
+          date: new Date().toLocaleDateString()
         };
+        setDoc(doc(db, 'stockTransactions', stockTxnId), newStockTxn, { silent: true });
 
-        await setDoc(doc(db, 'stockTransactions', stockTxnId), newStockTxn);
-
-        // Update Product Stock Count & Financials
         let newStockCount = linkedProduct.stockCount;
         let newTotalExpense = linkedProduct.totalExpense;
         let newTotalRevenue = linkedProduct.totalRevenue || 0;
-
-        if (stockType === 'IN') {
-          newStockCount += linkQty;
-          newTotalExpense += newTransaction.amount;
-        } else {
-          newStockCount = Math.max(0, newStockCount - linkQty);
-          newTotalRevenue += newTransaction.amount;
-        }
-
-        await updateDoc(doc(db, 'inventory', linkedProduct.id.toString()), {
-          stockCount: newStockCount,
-          totalExpense: newTotalExpense,
-          totalRevenue: newTotalRevenue
+        if (stockType === 'IN') { newStockCount += linkQty; newTotalExpense += parseFloat(formData.amount); }
+        else { newStockCount = Math.max(0, newStockCount - linkQty); newTotalRevenue += parseFloat(formData.amount); }
+        updateDoc(doc(db, 'inventory', linkedProduct.id.toString()), {
+          stockCount: newStockCount, totalExpense: newTotalExpense, totalRevenue: newTotalRevenue
         });
       }
     }
-
-    // Reset form
-    setFormData({
-      amount: '',
-      partyName: '',
-      remark: '',
-      category: '',
-      paymentMode: 'Cash',
-      type: 'IN',
-      isInventoryLinked: false,
-      selectedProductId: '',
-      inventoryQuantity: '',
-      imageFile: null
-    });
-
-    setCurrentView('dashboard');
   };
 
   // --- Calculations ---

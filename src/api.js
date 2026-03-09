@@ -2,7 +2,54 @@
 // Uses localStorage as primary cache, syncs with the API in the background.
 
 const BASE_URL = 'https://cashbook-api-59vg.onrender.com/api';
-const FETCH_TIMEOUT_MS = 5000; // 5 second max wait per request
+const FETCH_TIMEOUT_MS = 8000; // 8 second max wait per request
+
+// ─── Global Toast Notification System ────────────────────────────────────────
+let _toastContainer = null;
+const getToastContainer = () => {
+    if (!_toastContainer) {
+        _toastContainer = document.createElement('div');
+        _toastContainer.id = 'api-toast-container';
+        Object.assign(_toastContainer.style, {
+            position: 'fixed', bottom: '80px', left: '50%',
+            transform: 'translateX(-50%)', zIndex: '99999',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px',
+            pointerEvents: 'none'
+        });
+        document.body.appendChild(_toastContainer);
+    }
+    return _toastContainer;
+};
+
+export const showToast = (message, type = 'success') => {
+    const container = getToastContainer();
+    const toast = document.createElement('div');
+    const colors = {
+        success: 'background:#22c55e;color:#fff',
+        error: 'background:#ef4444;color:#fff',
+        info: 'background:#3b82f6;color:#fff',
+        warning: 'background:#f59e0b;color:#fff',
+    };
+    toast.setAttribute('style', `
+        padding:10px 20px; border-radius:12px; font-size:14px; font-weight:600;
+        box-shadow:0 4px 20px rgba(0,0,0,0.3); max-width:280px; text-align:center;
+        opacity:0; transform:translateY(10px);
+        transition: opacity 0.3s, transform 0.3s;
+        pointer-events:none; ${colors[type] || colors.info}
+    `);
+    toast.textContent = message;
+    container.appendChild(toast);
+    requestAnimationFrame(() => {
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateY(0)';
+    });
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(10px)';
+        setTimeout(() => toast.remove(), 350);
+    }, 3000);
+};
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Helper: fetch with a timeout so we never freeze the UI
 const fetchWithTimeout = (url, options = {}) => {
@@ -60,7 +107,7 @@ export const onSnapshot = (queryObj, callback) => {
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 10000); // Poll every 10s (not 3s)
+    const interval = setInterval(fetchData, 10000); // Poll every 10s
     return () => clearInterval(interval);
 };
 
@@ -87,40 +134,61 @@ export const getDoc = async (docRef) => {
     }
 };
 
-export const setDoc = async (docRef, data) => {
+// ─── setDoc: Optimistic-first save ───────────────────────────────────────────
+// 1. Updates localStorage instantly (UI feels immediate)
+// 2. Sends to API in background — if it fails, shows toast & rolls back cache
+export const setDoc = async (docRef, data, { silent = false } = {}) => {
     const endpoint = toEndpoint(docRef.collectionName);
     const payload = { ...data, id: docRef.id };
 
-    // ✅ Step 1: Update localStorage immediately (instant UI update)
+    // ① Update localStorage immediately (instant UI update)
     const cacheKey = `api_cache_${BASE_URL}/${endpoint}/${docRef.id}`;
-    localStorage.setItem(cacheKey, JSON.stringify(payload));
-    // Also push into list cache
     const listCacheKey = `api_cache_${BASE_URL}/${endpoint}`;
+    const prevItem = localStorage.getItem(cacheKey);
+
+    localStorage.setItem(cacheKey, JSON.stringify(payload));
+    const listBefore = localStorage.getItem(listCacheKey);
     try {
-        const listCached = JSON.parse(localStorage.getItem(listCacheKey) || '[]');
+        const listCached = JSON.parse(listBefore || '[]');
         const idx = listCached.findIndex(i => i.id === docRef.id);
-        if (idx >= 0) listCached[idx] = payload; else listCached.push(payload);
+        if (idx >= 0) listCached[idx] = payload; else listCached.unshift(payload);
         localStorage.setItem(listCacheKey, JSON.stringify(listCached));
     } catch (e) { }
 
-    // ✅ Step 2: POST to API in background (no blocking GET check)
+    // ② POST to API in background (non-blocking)
     try {
         const res = await fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
+        if (res.ok || res.status === 201) {
+            if (!silent) showToast('✓ Saved!', 'success');
+            return;
+        }
         if (res.status === 409 || res.status === 400) {
             // Conflict: doc exists — try PUT instead
-            fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`, {
+            const putRes = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
-            }).catch(() => { });
+            });
+            if (putRes.ok) {
+                if (!silent) showToast('✓ Saved!', 'success');
+                return;
+            }
         }
+        throw new Error(`HTTP ${res.status}`);
     } catch (e) {
-        // API offline/slow — localStorage already saved, data is safe
-        console.warn('setDoc: API sync failed (data saved locally):', e.message);
+        // Rollback cache on permanent failure
+        if (prevItem) localStorage.setItem(cacheKey, prevItem);
+        else localStorage.removeItem(cacheKey);
+        try {
+            const listCached = JSON.parse(listBefore || '[]');
+            localStorage.setItem(listCacheKey, JSON.stringify(listCached));
+        } catch (_) { }
+        if (!silent) showToast('⚠ Save failed — check connection', 'error');
+        console.warn('setDoc: API sync failed:', e.message);
     }
 };
 
