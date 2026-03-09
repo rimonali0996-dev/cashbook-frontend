@@ -17,6 +17,7 @@
     "@capacitor/share": "^8.0.1",
     "@tailwindcss/postcss": "^4.2.1",
     "browser-image-compression": "^2.0.2",
+    "dexie": "^4.3.0",
     "firebase": "^12.10.0",
     "i18next": "^25.8.14",
     "jspdf": "^4.2.0",

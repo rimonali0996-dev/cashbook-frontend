@@ -1,10 +1,28 @@
-// A compatibility layer to replace firebase/firestore using our MongoDB Express API
-// Uses localStorage as primary cache, syncs with the API in the background.
+/**
+ * api.js — Offline-First Data Layer (Dexie + Render API)
+ *
+ * Strategy per operation:
+ *   READ  → IndexedDB instantly (0 ms) + API sync in background
+ *   WRITE → IndexedDB instantly + enqueue to syncQueue + background API push
+ *   SYNC  → drain syncQueue on app-start & on 'online' event
+ */
+
+import db from './db.js';
 
 const BASE_URL = 'https://cashbook-api-59vg.onrender.com/api';
-const FETCH_TIMEOUT_MS = 8000; // 8 second max wait per request
+const FETCH_TIMEOUT_MS = 10000;
 
-// ─── Global Toast Notification System ────────────────────────────────────────
+// ─── Collection name mapping ──────────────────────────────────────────────────
+const collectionMap = {
+    stockTransactions: 'stock-transactions',
+    dueMessages: 'due-messages',
+};
+const toEndpoint = (name) => collectionMap[name] || name;
+
+// Dexie table name → db table (same as schema key)
+const tableFor = (collectionName) => db[collectionName];
+
+// ─── Global Toast ─────────────────────────────────────────────────────────────
 let _toastContainer = null;
 const getToastContainer = () => {
     if (!_toastContainer) {
@@ -14,7 +32,7 @@ const getToastContainer = () => {
             position: 'fixed', bottom: '80px', left: '50%',
             transform: 'translateX(-50%)', zIndex: '99999',
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px',
-            pointerEvents: 'none'
+            pointerEvents: 'none',
         });
         document.body.appendChild(_toastContainer);
     }
@@ -23,19 +41,19 @@ const getToastContainer = () => {
 
 export const showToast = (message, type = 'success') => {
     const container = getToastContainer();
-    const toast = document.createElement('div');
     const colors = {
         success: 'background:#22c55e;color:#fff',
         error: 'background:#ef4444;color:#fff',
         info: 'background:#3b82f6;color:#fff',
         warning: 'background:#f59e0b;color:#fff',
     };
+    const toast = document.createElement('div');
     toast.setAttribute('style', `
-        padding:10px 20px; border-radius:12px; font-size:14px; font-weight:600;
-        box-shadow:0 4px 20px rgba(0,0,0,0.3); max-width:280px; text-align:center;
-        opacity:0; transform:translateY(10px);
-        transition: opacity 0.3s, transform 0.3s;
-        pointer-events:none; ${colors[type] || colors.info}
+        padding:10px 20px;border-radius:12px;font-size:14px;font-weight:600;
+        box-shadow:0 4px 20px rgba(0,0,0,0.3);max-width:280px;text-align:center;
+        opacity:0;transform:translateY(10px);
+        transition:opacity 0.3s,transform 0.3s;
+        pointer-events:none;${colors[type] || colors.info}
     `);
     toast.textContent = message;
     container.appendChild(toast);
@@ -49,9 +67,31 @@ export const showToast = (message, type = 'success') => {
         setTimeout(() => toast.remove(), 350);
     }, 3000);
 };
-// ─────────────────────────────────────────────────────────────────────────────
 
-// Helper: fetch with a timeout so we never freeze the UI
+// ─── Connectivity badge ───────────────────────────────────────────────────────
+let _pendingCount = 0;
+const updateOfflineBadge = async () => {
+    _pendingCount = await db.syncQueue.count();
+    let badge = document.getElementById('offline-badge');
+    if (_pendingCount > 0) {
+        if (!badge) {
+            badge = document.createElement('div');
+            badge.id = 'offline-badge';
+            Object.assign(badge.style, {
+                position: 'fixed', top: '12px', right: '12px', zIndex: '99998',
+                background: '#f59e0b', color: '#fff', borderRadius: '20px',
+                padding: '4px 12px', fontSize: '12px', fontWeight: '700',
+                boxShadow: '0 2px 8px rgba(0,0,0,0.3)', pointerEvents: 'none',
+            });
+            document.body.appendChild(badge);
+        }
+        badge.textContent = `⏳ ${_pendingCount} pending`;
+    } else if (badge) {
+        badge.remove();
+    }
+};
+
+// ─── Fetch with timeout ───────────────────────────────────────────────────────
 const fetchWithTimeout = (url, options = {}) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -59,168 +99,228 @@ const fetchWithTimeout = (url, options = {}) => {
         .finally(() => clearTimeout(timer));
 };
 
-const collectionMap = {
-    stockTransactions: 'stock-transactions',
-    dueMessages: 'due-messages'
-};
-const toEndpoint = (name) => collectionMap[name] || name;
+// ─── Background Sync Queue ────────────────────────────────────────────────────
+export const syncPendingQueue = async () => {
+    const pending = await db.syncQueue.orderBy('createdAt').toArray();
+    if (pending.length === 0) return;
 
-export const doc = (db, collectionName, id) => ({ collectionName, id });
-export const collection = (db, collectionName) => ({ collectionName });
+    for (const item of pending) {
+        try {
+            const endpoint = toEndpoint(item.collection);
+            let res;
+            if (item.op === 'DELETE') {
+                res = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${item.docId}`, { method: 'DELETE' });
+            } else {
+                // Try POST first, fall back to PUT on conflict
+                res = await fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(item.data),
+                });
+                if (res.status === 409 || res.status === 400) {
+                    res = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${item.docId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(item.data),
+                    });
+                }
+            }
+            if (res.ok || res.status === 201) {
+                await db.syncQueue.delete(item.queueId);
+            }
+        } catch {
+            // Still offline — leave in queue, retry next time
+            break;
+        }
+    }
+    await updateOfflineBadge();
+    const remaining = await db.syncQueue.count();
+    if (remaining === 0 && pending.length > 0) {
+        showToast('☁ All data synced!', 'success');
+    }
+};
+
+// Run sync on app load and whenever we go back online
+window.addEventListener('online', () => {
+    showToast('🌐 Connection restored — syncing...', 'info');
+    syncPendingQueue();
+});
+window.addEventListener('offline', () => showToast('📵 Offline mode — data saved locally', 'warning'));
+
+// Initial sync attempt (catches anything queued from last session)
+setTimeout(syncPendingQueue, 3000);
+
+// ─── Firebase-compatible shim exports ─────────────────────────────────────────
+export const doc = (_db, collectionName, id) => ({ collectionName, id });
+export const collection = (_db, collectionName) => ({ collectionName });
 export const query = (colObj, whereObj) => ({ ...colObj, ...whereObj });
 export const where = (field, op, val) => {
     if (field === 'businessId' && op === '==') return { businessId: val };
     return {};
 };
 
-// onSnapshot: call callback immediately from localStorage, then sync with API
+// ─── onSnapshot: IndexedDB-first, then background API refresh ────────────────
 export const onSnapshot = (queryObj, callback) => {
-    const endpoint = toEndpoint(queryObj.collectionName);
-    let url = `${BASE_URL}/${endpoint}`;
-    if (queryObj.businessId) url += `/${queryObj.businessId}`;
+    const { collectionName, businessId } = queryObj;
+    const table = tableFor(collectionName);
+    if (!table) return () => { };
 
-    const makeSnapshot = (data) => ({
-        docs: data.map(item => ({ id: item.id, data: () => item }))
+    const makeSnap = (rows) => ({
+        docs: rows.map(item => ({ id: item.id, data: () => item })),
     });
 
-    // Immediately serve from localStorage cache
-    const cacheKey = `api_cache_${url}`;
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-        try { callback(makeSnapshot(JSON.parse(cached))); } catch (e) { }
-    }
+    // ① Instant read from IndexedDB (0 ms)
+    const readLocal = async () => {
+        try {
+            const rows = businessId
+                ? await table.where('businessId').equals(businessId).toArray()
+                : await table.toArray();
+            rows.sort((a, b) => (b.createdAt || b.id) > (a.createdAt || a.id) ? 1 : -1);
+            callback(makeSnap(rows));
+        } catch { /* table might not exist yet */ }
+    };
+    readLocal();
 
-    // Then fetch from API and update
-    const fetchData = async () => {
+    // ② Background API fetch — update IndexedDB + re-call callback
+    const endpoint = toEndpoint(collectionName);
+    const url = businessId
+        ? `${BASE_URL}/${endpoint}/${businessId}`
+        : `${BASE_URL}/${endpoint}`;
+
+    const fetchRemote = async () => {
         try {
             const res = await fetchWithTimeout(url);
             if (!res.ok) return;
             const raw = await res.json();
-            // Handle paginated response { data: [], total, page, pages }
-            // as well as plain array responses from non-paginated endpoints
-            const data = Array.isArray(raw) ? raw : (raw.data || []);
-            localStorage.setItem(cacheKey, JSON.stringify(data));
-            callback(makeSnapshot(data));
-        } catch (err) {
-            // Timeout or network error — silently use cached data
-        }
+            const rows = Array.isArray(raw) ? raw : (raw.data || []);
+            if (rows.length === 0) return;
+            // Bulk upsert into IndexedDB
+            await table.bulkPut(rows);
+            await readLocal(); // re-read sorted from DB
+        } catch { /* offline or timeout — local data stays */ }
     };
+    fetchRemote();
 
-    fetchData();
-    const interval = setInterval(fetchData, 10000); // Poll every 10s
+    const interval = setInterval(fetchRemote, 15000); // refresh every 15s
     return () => clearInterval(interval);
 };
 
+// ─── getDoc ───────────────────────────────────────────────────────────────────
 export const getDoc = async (docRef) => {
-    const endpoint = toEndpoint(docRef.collectionName);
-    // Fast path: check localStorage first
-    const cacheKey = `api_cache_${BASE_URL}/${endpoint}/${docRef.id}`;
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-        try {
-            const data = JSON.parse(cached);
-            return { exists: () => true, data: () => data };
-        } catch (e) { }
+    const table = tableFor(docRef.collectionName);
+
+    // Fast: IndexedDB
+    if (table) {
+        const local = await table.get(docRef.id);
+        if (local) return { exists: () => true, data: () => local };
     }
-    // Slow path: network
+
+    // Slow: network
     try {
+        const endpoint = toEndpoint(docRef.collectionName);
         const res = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`);
         if (!res.ok) return { exists: () => false, data: () => null };
         const data = await res.json();
-        localStorage.setItem(cacheKey, JSON.stringify(data));
+        if (table) await table.put(data);
         return { exists: () => true, data: () => data };
-    } catch (err) {
+    } catch {
         return { exists: () => false, data: () => null };
     }
 };
 
-// ─── setDoc: Optimistic-first save ───────────────────────────────────────────
-// 1. Updates localStorage instantly (UI feels immediate)
-// 2. Sends to API in background — if it fails, shows toast & rolls back cache
+// ─── setDoc: IndexedDB instantly + enqueue for API ───────────────────────────
 export const setDoc = async (docRef, data, { silent = false } = {}) => {
-    const endpoint = toEndpoint(docRef.collectionName);
-    const payload = { ...data, id: docRef.id };
+    const { collectionName, id } = docRef;
+    const payload = { ...data, id };
+    const table = tableFor(collectionName);
 
-    // ① Update localStorage immediately (instant UI update)
-    const cacheKey = `api_cache_${BASE_URL}/${endpoint}/${docRef.id}`;
-    const listCacheKey = `api_cache_${BASE_URL}/${endpoint}`;
-    const prevItem = localStorage.getItem(cacheKey);
+    // ① Write to IndexedDB immediately — UI updates at 0 ms
+    if (table) await table.put(payload);
 
-    localStorage.setItem(cacheKey, JSON.stringify(payload));
-    const listBefore = localStorage.getItem(listCacheKey);
-    try {
-        const listCached = JSON.parse(listBefore || '[]');
-        const idx = listCached.findIndex(i => i.id === docRef.id);
-        if (idx >= 0) listCached[idx] = payload; else listCached.unshift(payload);
-        localStorage.setItem(listCacheKey, JSON.stringify(listCached));
-    } catch (e) { }
+    // ② Enqueue for API sync
+    await db.syncQueue.add({
+        collection: collectionName,
+        docId: id,
+        op: 'POST',
+        data: payload,
+        createdAt: Date.now(),
+    });
+    await updateOfflineBadge();
 
-    // ② POST to API in background (non-blocking)
-    try {
-        const res = await fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+    // ③ Try to push right now (background, non-blocking)
+    const endpoint = toEndpoint(collectionName);
+    fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(async (res) => {
         if (res.ok || res.status === 201) {
+            // Remove from queue on success
+            const item = await db.syncQueue
+                .where({ collection: collectionName, docId: id }).last();
+            if (item) await db.syncQueue.delete(item.queueId);
+            await updateOfflineBadge();
             if (!silent) showToast('✓ Saved!', 'success');
-            return;
-        }
-        if (res.status === 409 || res.status === 400) {
-            // Conflict: doc exists — try PUT instead
-            const putRes = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`, {
+        } else if (res.status === 409 || res.status === 400) {
+            // Conflict → try PUT
+            fetchWithTimeout(`${BASE_URL}/${endpoint}/${id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (putRes.ok) {
-                if (!silent) showToast('✓ Saved!', 'success');
-                return;
-            }
+                body: JSON.stringify(payload),
+            }).then(async (r2) => {
+                if (r2.ok) {
+                    const item = await db.syncQueue
+                        .where({ collection: collectionName, docId: id }).last();
+                    if (item) await db.syncQueue.delete(item.queueId);
+                    await updateOfflineBadge();
+                    if (!silent) showToast('✓ Saved!', 'success');
+                }
+            }).catch(() => { });
         }
-        throw new Error(`HTTP ${res.status}`);
-    } catch (e) {
-        // Rollback cache on permanent failure
-        if (prevItem) localStorage.setItem(cacheKey, prevItem);
-        else localStorage.removeItem(cacheKey);
-        try {
-            const listCached = JSON.parse(listBefore || '[]');
-            localStorage.setItem(listCacheKey, JSON.stringify(listCached));
-        } catch (_) { }
-        if (!silent) showToast('⚠ Save failed — check connection', 'error');
-        console.warn('setDoc: API sync failed:', e.message);
-    }
+    }).catch(() => {
+        // Offline — item already in queue, will sync when back online
+        if (!silent) showToast('📵 Saved offline — will sync later', 'warning');
+    });
 };
 
+// ─── updateDoc ────────────────────────────────────────────────────────────────
 export const updateDoc = async (docRef, data) => {
-    const endpoint = toEndpoint(docRef.collectionName);
-    // Update local cache immediately
-    const cacheKey = `api_cache_${BASE_URL}/${endpoint}/${docRef.id}`;
-    try {
-        const existing = JSON.parse(localStorage.getItem(cacheKey) || '{}');
-        const updated = { ...existing, ...data };
-        localStorage.setItem(cacheKey, JSON.stringify(updated));
-    } catch (e) { }
-    // Background API sync
-    try {
-        await fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`, {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
-        });
-    } catch (e) { }
+    const { collectionName, id } = docRef;
+    const table = tableFor(collectionName);
+
+    // Patch IndexedDB record
+    if (table) {
+        const existing = (await table.get(id)) || {};
+        await table.put({ ...existing, ...data, id });
+    }
+
+    // Background PUT
+    const endpoint = toEndpoint(collectionName);
+    fetchWithTimeout(`${BASE_URL}/${endpoint}/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    }).catch(() => {
+        // Enqueue if offline
+        db.syncQueue.add({
+            collection: collectionName, docId: id,
+            op: 'PUT', data, createdAt: Date.now(),
+        }).then(updateOfflineBadge);
+    });
 };
 
+// ─── deleteDoc ────────────────────────────────────────────────────────────────
 export const deleteDoc = async (docRef) => {
-    const endpoint = toEndpoint(docRef.collectionName);
-    // Remove from local cache immediately
-    localStorage.removeItem(`api_cache_${BASE_URL}/${endpoint}/${docRef.id}`);
-    const listCacheKey = `api_cache_${BASE_URL}/${endpoint}`;
-    try {
-        const listCached = JSON.parse(localStorage.getItem(listCacheKey) || '[]');
-        localStorage.setItem(listCacheKey, JSON.stringify(listCached.filter(i => i.id !== docRef.id)));
-    } catch (e) { }
-    // Background API sync
-    try {
-        await fetchWithTimeout(`${BASE_URL}/${endpoint}/${docRef.id}`, { method: 'DELETE' });
-    } catch (e) { }
+    const { collectionName, id } = docRef;
+    const table = tableFor(collectionName);
+    if (table) await table.delete(id);
+
+    const endpoint = toEndpoint(collectionName);
+    fetchWithTimeout(`${BASE_URL}/${endpoint}/${id}`, { method: 'DELETE' })
+        .catch(() => {
+            db.syncQueue.add({
+                collection: collectionName, docId: id,
+                op: 'DELETE', data: null, createdAt: Date.now(),
+            }).then(updateOfflineBadge);
+        });
 };
