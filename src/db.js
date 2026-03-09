@@ -7,8 +7,8 @@ import Dexie from 'dexie';
 
 export const db = new Dexie('CashbookDB');
 
+// v1 — initial schema
 db.version(1).stores({
-    // Each store: primary key first (&id = unique), then indexed fields
     businesses: '&id',
     cashbooks: '&id, businessId',
     transactions: '&id, businessId, cashbookId, createdAt',
@@ -19,6 +19,12 @@ db.version(1).stores({
     // Pending writes queue — operations that haven't reached the server yet
     // op: 'POST' | 'PUT' | 'DELETE'
     syncQueue: '++queueId, collection, op, createdAt',
+});
+
+// v2 — add compound index [collection+docId] so we can efficiently
+//       find/delete a specific doc's pending queue entries
+db.version(2).stores({
+    syncQueue: '++queueId, collection, op, createdAt, [collection+docId]',
 });
 
 export default db;

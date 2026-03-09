@@ -104,6 +104,7 @@ export const syncPendingQueue = async () => {
     const pending = await db.syncQueue.orderBy('createdAt').toArray();
     if (pending.length === 0) return;
 
+    let syncedCount = 0;
     for (const item of pending) {
         try {
             const endpoint = toEndpoint(item.collection);
@@ -111,7 +112,6 @@ export const syncPendingQueue = async () => {
             if (item.op === 'DELETE') {
                 res = await fetchWithTimeout(`${BASE_URL}/${endpoint}/${item.docId}`, { method: 'DELETE' });
             } else {
-                // Try POST first, fall back to PUT on conflict
                 res = await fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -126,16 +126,15 @@ export const syncPendingQueue = async () => {
                 }
             }
             if (res.ok || res.status === 201) {
-                await db.syncQueue.delete(item.queueId);
+                await db.syncQueue.delete(item.queueId); // delete by auto-increment PK
+                syncedCount++;
             }
         } catch {
-            // Still offline — leave in queue, retry next time
-            break;
+            break; // Still offline — leave in queue
         }
     }
     await updateOfflineBadge();
-    const remaining = await db.syncQueue.count();
-    if (remaining === 0 && pending.length > 0) {
+    if (syncedCount > 0 && (await db.syncQueue.count()) === 0) {
         showToast('☁ All data synced!', 'success');
     }
 };
@@ -249,17 +248,24 @@ export const setDoc = async (docRef, data, { silent = false } = {}) => {
 
     // ③ Try to push right now (background, non-blocking)
     const endpoint = toEndpoint(collectionName);
+
+    // Helper: remove this doc's pending entries from syncQueue
+    const clearFromQueue = async () => {
+        // Use [collection+docId] compound index (defined in db.js v2)
+        const keys = await db.syncQueue
+            .where('[collection+docId]').equals([collectionName, id])
+            .primaryKeys();
+        if (keys.length) await db.syncQueue.bulkDelete(keys);
+        await updateOfflineBadge();
+    };
+
     fetchWithTimeout(`${BASE_URL}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     }).then(async (res) => {
         if (res.ok || res.status === 201) {
-            // Remove from queue on success
-            const item = await db.syncQueue
-                .where({ collection: collectionName, docId: id }).last();
-            if (item) await db.syncQueue.delete(item.queueId);
-            await updateOfflineBadge();
+            await clearFromQueue();
             if (!silent) showToast('✓ Saved!', 'success');
         } else if (res.status === 409 || res.status === 400) {
             // Conflict → try PUT
@@ -269,10 +275,7 @@ export const setDoc = async (docRef, data, { silent = false } = {}) => {
                 body: JSON.stringify(payload),
             }).then(async (r2) => {
                 if (r2.ok) {
-                    const item = await db.syncQueue
-                        .where({ collection: collectionName, docId: id }).last();
-                    if (item) await db.syncQueue.delete(item.queueId);
-                    await updateOfflineBadge();
+                    await clearFromQueue();
                     if (!silent) showToast('✓ Saved!', 'success');
                 }
             }).catch(() => { });
