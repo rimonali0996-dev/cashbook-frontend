@@ -10,7 +10,7 @@ import './i18n/config'; // Import i18n setup
 import { fontBase64 } from './fonts/NotoSansBengali-Regular';
 
 // --- Firebase & Image Compression ---
-import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, query, where, showToast } from './api';
+import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, query, where, showToast, getSyncQueue, deleteSyncQueueItem, clearFailedItems, clearAllPending, syncPendingQueue } from './api';
 const db = {}; // api.js handles routing — db is a placeholder
 import imageCompression from 'browser-image-compression';
 
@@ -27,7 +27,25 @@ function App() {
   const fileInputRef = useRef(null);
   const [showSettings, setShowSettings] = useState(false);
   const [appTheme, setAppTheme] = useState(() => localStorage.getItem('appTheme') || 'neon');
-  const [isSaving, setIsSaving] = useState(false); // button loading state
+  const [isSaving, setIsSaving] = useState(false);
+  const [showSyncQueue, setShowSyncQueue] = useState(false);
+  const [syncQueueItems, setSyncQueueItems] = useState([]);
+
+  // Listen for badge click → open sync queue panel
+  useEffect(() => {
+    const handler = async () => {
+      const items = await getSyncQueue();
+      setSyncQueueItems(items);
+      setShowSyncQueue(true);
+    };
+    window.addEventListener('openSyncQueue', handler);
+    return () => window.removeEventListener('openSyncQueue', handler);
+  }, []);
+
+  const refreshSyncQueue = async () => {
+    const items = await getSyncQueue();
+    setSyncQueueItems(items);
+  };
 
   useEffect(() => {
     if (appTheme && appTheme !== 'neon') {
@@ -2224,6 +2242,122 @@ function App() {
               )}
 
             </div>
+          </div>
+        </div>
+      )}
+
+
+      {/* ─── Sync Queue Manager Modal ───────────────────────────────── */}
+      {showSyncQueue && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, zIndex: 99990, background: 'rgba(0,0,0,0.75)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px'
+          }}
+          onClick={(e) => e.target === e.currentTarget && setShowSyncQueue(false)}
+        >
+          <div className="glass-panel" style={{
+            width: '100%', maxWidth: '480px', borderRadius: '20px',
+            padding: '24px', maxHeight: '80vh', display: 'flex', flexDirection: 'column', gap: '16px'
+          }}>
+
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h2 style={{ fontSize: '18px', fontWeight: '700', color: 'var(--neon-cyan)' }}>
+                ⏳ Pending Sync Queue
+              </h2>
+              <button onClick={() => setShowSyncQueue(false)}
+                style={{
+                  background: 'transparent', border: 'none', color: '#fff', fontSize: '22px',
+                  cursor: 'pointer', lineHeight: 1
+                }}>✕</button>
+            </div>
+
+            {/* Action Buttons */}
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                onClick={async () => { await syncPendingQueue(); await refreshSyncQueue(); }}
+                style={{
+                  flex: 1, padding: '8px 12px', borderRadius: '10px', border: 'none',
+                  background: 'var(--neon-cyan)', color: '#000', fontWeight: '700', cursor: 'pointer',
+                  fontSize: '13px'
+                }}>
+                🔄 Retry Now
+              </button>
+              <button
+                onClick={async () => { await clearFailedItems(); await refreshSyncQueue(); }}
+                style={{
+                  flex: 1, padding: '8px 12px', borderRadius: '10px', border: 'none',
+                  background: '#ef4444', color: '#fff', fontWeight: '700', cursor: 'pointer',
+                  fontSize: '13px'
+                }}>
+                🗑 Clear Failed
+              </button>
+              <button
+                onClick={async () => {
+                  if (window.confirm('Delete ALL pending items? This may cause data loss!')) {
+                    await clearAllPending(); await refreshSyncQueue();
+                  }
+                }}
+                style={{
+                  padding: '8px 12px', borderRadius: '10px', border: '1px solid #555',
+                  background: 'transparent', color: '#aaa', fontWeight: '600', cursor: 'pointer',
+                  fontSize: '13px'
+                }}>
+                Clear All
+              </button>
+            </div>
+
+            {/* Queue List */}
+            <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {syncQueueItems.length === 0 ? (
+                <div style={{ textAlign: 'center', color: '#22c55e', padding: '24px', fontWeight: '600' }}>
+                  ✅ Queue is empty — all synced!
+                </div>
+              ) : syncQueueItems.map(item => {
+                const retries = item.retryCount || 0;
+                const failed = retries >= 3;
+                const colLabel = {
+                  transactions: 'Transaction', dueMessages: 'Due Msg',
+                  inventory: 'Product', stockTransactions: 'Stock', cashbooks: 'Cashbook'
+                }[item.collection] || item.collection;
+
+                return (
+                  <div key={item.queueId}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px',
+                      borderRadius: '12px', background: failed ? 'rgba(239,68,68,0.15)' : 'rgba(255,255,255,0.05)',
+                      border: `1px solid ${failed ? 'rgba(239,68,68,0.4)' : 'rgba(255,255,255,0.1)'}`
+                    }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        fontSize: '13px', fontWeight: '600', color: failed ? '#f87171' : '#fff',
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+                      }}>
+                        {failed ? '❌' : '⏳'} {colLabel} — {item.op}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#888', marginTop: '2px' }}>
+                        Retries: {retries}/3
+                        {item.lastError ? ` · ${item.lastError}` : ''}
+                      </div>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        await deleteSyncQueueItem(item.queueId);
+                        await refreshSyncQueue();
+                      }}
+                      style={{
+                        background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.4)',
+                        color: '#f87171', borderRadius: '8px', padding: '4px 10px',
+                        fontSize: '12px', cursor: 'pointer', fontWeight: '600', flexShrink: 0
+                      }}>
+                      Delete
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
           </div>
         </div>
       )}
