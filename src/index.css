@@ -1,0 +1,146 @@
+@import "tailwindcss";
+
+/* Base/Neon variables (Default) */
+:root {
+  --app-bg: #0b0c10;
+  --app-text: #ffffff;
+  --neon-cyan: #00f3ff;
+  --neon-pink: #ff00ea;
+  --neon-purple: #b026ff;
+  
+  --glass-bg: rgba(20, 20, 35, 0.4);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-glow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  
+  --border-cyan-box: inset 0 0 10px rgba(0, 243, 255, 0.2), 0 0 15px rgba(0, 243, 255, 0.3);
+  --border-cyan-line: 1px solid rgba(0, 243, 255, 0.4);
+  --border-pink-box: inset 0 0 10px rgba(255, 0, 234, 0.2), 0 0 15px rgba(255, 0, 234, 0.3);
+  --border-pink-line: 1px solid rgba(255, 0, 234, 0.4);
+  --border-purple-box: inset 0 0 10px rgba(176, 38, 255, 0.2), 0 0 15px rgba(176, 38, 255, 0.3);
+  --border-purple-line: 1px solid rgba(176, 38, 255, 0.4);
+
+  --text-cyan-shadow: 0 0 8px rgba(0, 243, 255, 0.6);
+  --text-pink-shadow: 0 0 8px rgba(255, 0, 234, 0.6);
+  --text-purple-shadow: 0 0 8px rgba(176, 38, 255, 0.6);
+}
+
+/* Light classic theme */
+[data-theme='light'] {
+  --app-bg: #f9fafb;
+  --app-text: #1f2937;
+  --neon-cyan: #0284c7; /* standard blue instead of cyan neon */
+  --neon-pink: #e11d48; /* rose instead of pink neon */
+  --neon-purple: #7e22ce;
+  
+  --glass-bg: #ffffff;
+  --glass-border: #e5e7eb;
+  --glass-glow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  
+  --border-cyan-box: none;
+  --border-cyan-line: 1px solid var(--neon-cyan);
+  --border-pink-box: none;
+  --border-pink-line: 1px solid var(--neon-pink);
+  --border-purple-box: none;
+  --border-purple-line: 1px solid var(--neon-purple);
+
+  --text-cyan-shadow: none;
+  --text-pink-shadow: none;
+  --text-purple-shadow: none;
+}
+
+/* Dark classic theme (No Neon) */
+[data-theme='dark'] {
+  --app-bg: #111827;
+  --app-text: #f9fafb;
+  --neon-cyan: #38bdf8;
+  --neon-pink: #fb7185;
+  --neon-purple: #c084fc;
+  
+  --glass-bg: #1f2937;
+  --glass-border: #374151;
+  --glass-glow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+  
+  --border-cyan-box: none;
+  --border-cyan-line: 1px solid var(--neon-cyan);
+  --border-pink-box: none;
+  --border-pink-line: 1px solid var(--neon-pink);
+  --border-purple-box: none;
+  --border-purple-line: 1px solid var(--neon-purple);
+
+  --text-cyan-shadow: none;
+  --text-pink-shadow: none;
+  --text-purple-shadow: none;
+}
+
+body {
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  min-height: 100vh;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Glass & Theme Utilities */
+@layer utilities {
+  .glass-panel {
+    background: var(--glass-bg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--glass-glow);
+    transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .neon-border-cyan {
+    box-shadow: var(--border-cyan-box);
+    border: var(--border-cyan-line);
+  }
+
+  .neon-border-pink {
+    box-shadow: var(--border-pink-box);
+    border: var(--border-pink-line);
+  }
+  
+  .neon-border-purple {
+    box-shadow: var(--border-purple-box);
+    border: var(--border-purple-line);
+  }
+
+  .neon-text-cyan {
+    color: var(--neon-cyan);
+    text-shadow: var(--text-cyan-shadow);
+  }
+
+  .neon-text-pink {
+    color: var(--neon-pink);
+    text-shadow: var(--text-pink-shadow);
+  }
+  
+  .neon-text-purple {
+    color: var(--neon-purple);
+    text-shadow: var(--text-purple-shadow);
+  }
+
+  /* Specific glowing buttons */
+  .btn-glow {
+    position: relative;
+    overflow: hidden;
+    transition: all 0.3s ease;
+  }
+  
+  .btn-glow:hover {
+    box-shadow: 0 0 15px var(--neon-cyan);
+    border-color: var(--neon-cyan);
+  }
+}
+
+/* Hard tailwind overrides for Light mode to reverse white/gray hardcolors */
+[data-theme='light'] .text-white { color: #111827 !important; }
+[data-theme='light'] .text-gray-400 { color: #6b7280 !important; }
+[data-theme='light'] .text-gray-300 { color: #4b5563 !important; }
+[data-theme='light'] .text-gray-100 { color: #1f2937 !important; }
+[data-theme='light'] .text-gray-500 { color: #9ca3af !important; }
+[data-theme='light'] .bg-black\/40 { background-color: #f3f4f6 !important; }
+[data-theme='light'] .bg-gray-800\/50 { background-color: #e5e7eb !important; }
+[data-theme='light'] .border-white\/10 { border-color: #d1d5db !important; }
+[data-theme='light'] .bg-cyan-500\/10, [data-theme='light'] .bg-pink-500\/10 { background-color: #f0fdfa !important; }
+[data-theme='light'] .hover\:bg-pink-500\/10:hover { background-color: #ffe4e6 !important; }
